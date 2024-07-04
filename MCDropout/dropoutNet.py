@@ -4,24 +4,29 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-
-import argparse
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 from torchvision import datasets, transforms
-from torch import nn, optim
+from torch import nn, optim, Tensor
+from torch.utils.data import DataLoader
 from torch.nn import functional as F
+from torch.optim import Optimizer
+import matplotlib.pyplot as plt
+from typing import Tuple
+import argparse
+
+import numpy as np
+import sys
 import shap
 
 class Net(nn.Module):
-    def __init__(self, forward_passes: int = 20, mode: str = 'mean'):
+    def __init__(self, forward_passes: int = 20, mode: str = 'point') -> None:
+        """Initialize the network."""
         super(Net, self).__init__()
-        # Initialize variables
+        
         self.forward_passes = forward_passes
         self.mode = mode
 
-        # Define model layers
+        # Convolutional layers
         self.conv_layers = nn.Sequential(
             nn.Conv2d(1, 10, kernel_size=5),
             nn.MaxPool2d(2),
@@ -31,8 +36,10 @@ class Net(nn.Module):
             nn.Dropout(),
             nn.MaxPool2d(2),
             nn.ReLU(),
-            nn.Dropout(p=0.3)
+            nn.Dropout(p=0.3),        
         )
+        
+        # Fully connected layers
         self.fc_layers = nn.Sequential(
             nn.Linear(320, 50),
             nn.ReLU(),
@@ -42,33 +49,25 @@ class Net(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the network."""
         if self.mode == 'point':
             x = self.conv_layers(x)
             x = x.view(-1, 320)
             x = self.fc_layers(x)
 
         elif self.mode == 'total_entropy':
-            x = self.conv_layers(x)
-            x = x.view(-1, 320)
-            x = self.fc_layers(x)
-            x = self.total_entropy(x)
-
-        elif self.mode == 'ep_entropy':
-            ep_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'ep_entropy')
-            x = ep_entropy
+            total_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'total_entropy')
+            x = total_entropy
 
         elif self.mode == 'al_entropy':
-            conv_out = self.conv_layers(x)
-            conv_out = conv_out.view(-1, 320)
-            fc_out = self.fc_layers(conv_out)
-            total_entropy = self.total_entropy(fc_out)
-
-            ep_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'ep_entropy')
-            al_entropy = total_entropy - ep_entropy
+            al_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'al_entropy')
             x = al_entropy
-            # print(ep_entropy)
-            # print(al_entropy)
-            # print(total_entropy)
+
+        elif self.mode == 'ep_entropy':
+            total_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'total_entropy')
+            al_entropy = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, 'al_entropy')
+            ep_entropy = total_entropy - al_entropy
+            x = ep_entropy
 
         else:
             x = self.get_monte_carlo_predictions(x, x.size()[0], self.forward_passes, self.mode)
@@ -76,76 +75,125 @@ class Net(nn.Module):
         return x
     
     def total_entropy(self, x: torch.Tensor) -> torch.Tensor:
+        """Calculate total entropy."""
         entropy = -torch.sum(x * torch.log(x), dim=-1)
-        return entropy[:,None]
+        return entropy[:, None]
 
-    def enable_dropout(self):
-        """ Function to enable the dropout layers during test-time """
+    def enable_dropout(self) -> None:
+        """Enable dropout layers during test-time."""
         for m in self.modules():
             if m.__class__.__name__.startswith('Dropout'):
                 m.train()
-
-    def get_monte_carlo_predictions(self, x, batch, forward_passes, mode, device=torch.device('cuda')):
+                
+    def get_monte_carlo_predictions(self, x: torch.Tensor, batch: int, forward_passes: int, mode: str) -> torch.Tensor:
+        """Get Monte Carlo predictions."""
         n_classes = 2
         n_samples = batch
+        device = x.device
         dropout_predictions = torch.empty((0, n_samples, n_classes), device=device)
+        
         for i in range(forward_passes):
-            predictions = torch.empty((0, n_classes), device=device)
             self.enable_dropout()
             conv_out = self.conv_layers(x)
             reshape_out = conv_out.view(-1, 320)
             predictions = self.fc_layers(reshape_out)
-
             dropout_predictions = torch.cat((dropout_predictions, predictions.unsqueeze(0)), dim=0)
-            
 
-        # Calculating mean across multiple MCD forward passes 
-        mean = dropout_predictions.mean(dim=0) # shape (n_samples, n_classes)
+        # Calculate mean across multiple MCD forward passes
+        mean = dropout_predictions.mean(dim=0)
 
-        # Calculating entropy across multiple MCD forward passes 
+        # Calculate entropy across multiple MCD forward passes
         entropy = -torch.sum(dropout_predictions * torch.log(dropout_predictions), dim=-1)
         entropy = entropy.mean(dim=0)
+
+        if mode == 'al_entropy':
+            return entropy[:, None]
         
-        if mode =='mean':
+        if mode == 'total_entropy':
+            return self.total_entropy(mean)
+        
+        if mode == "mean":
             return mean
         
-        if mode == 'ep_entropy':
-            return entropy[:,None]
-        
 
-def train(model: nn.Module, device: torch.device, train_loader: torch.utils.data.DataLoader,
-          optimizer: optim.Optimizer, epoch: int):
-    model.train()
+def train(model: torch.nn.Module, 
+          device: torch.device, 
+          train_loader: DataLoader, 
+          optimizer: optim.Optimizer, 
+          epoch: int) -> None:
+    
+    model.train() 
+    total = 0      
+    correct = 0     
+    
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output.log(), target)
+        loss = F.nll_loss(output.log(), target) 
         loss.backward()
         optimizer.step()
+        
+        # Calculate number of correctly classified samples in the current batch
+        pred = output.argmax(dim=1, keepdim=True)  
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        total += data.size(0)
+        
         if batch_idx % 100 == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item()))
+            print(f'Train Epoch: {epoch} '
+                  f'Loss: {loss.item():.6f} Correct: {correct}/{total}')
 
+def create_shap_plots(model: torch.nn.Module, 
+                      background: Tensor, 
+                      test_images: Tensor, 
+                      mode: str,
+                      class1: str,
+                      class2: str) -> None:
+    """
+    Create SHAP plots for the model predictions.
 
-def create_shap_plots(model: nn.Module, background: torch.Tensor, 
-                      test_images: torch.Tensor, mode: str):
-    # Generate SHAP plots
+    Parameters:
+    - model: The trained neural network model.
+    - background: Background data for the SHAP explainer.
+    - test_images: Images to be explained.
+    - mode: The mode for SHAP plotting.
+
+    Returns:
+    - None
+    """
     explainer = shap.DeepExplainer(model, background)
     shap_values = np.asarray(explainer.shap_values(test_images))
-    #Create shap plots
-    if mode == 'al_entropy' or mode == 'total_entropy' or mode == 'ep_entropy': 
-        test_images_cpu = test_images.to(torch.device('cpu'))
+
+    test_images_cpu = test_images.to(torch.device('cpu'))
+
+    plt.ioff()
+
+    if mode in ['al_entropy', 'total_entropy', 'ep_entropy']:
         shap_entropy_numpy = np.swapaxes(np.swapaxes(shap_values, 1, -1), 1, 2)
         test_entropy_numpy = np.swapaxes(np.swapaxes(np.asarray(test_images_cpu), 1, -1), 1, 2)
-        shap.image_plot(shap_entropy_numpy, -test_entropy_numpy)
+        shap.image_plot(shap_entropy_numpy, -test_entropy_numpy, show=False)
+        fig = plt.gcf()
+        fig.savefig(f"../figs/{class1}_{class2}/{mode}.png")
+        plt.close(fig)
 
-    elif mode == 'mean' or mode == 'point':
-        test_images_cpu = test_images.to(torch.device('cpu'))
+    elif mode in ['mean', 'point']:
+        # transformed_shap_values = []
+        # shap_values_transposed = np.transpose(shap_values, (0, 4, 1, 2, 3))
+
+        # # Iterate over each model output and reshape accordingly
+        # for i in range(shap_values_transposed.shape[1]):
+        #     shap_for_output = shap_values_transposed[:, i, :, :, :]
+        #     shap_for_output = np.reshape(shap_for_output, (shap_for_output.shape[0], 28, 28, 1))
+        #     transformed_shap_values.append(shap_for_output)
+        # test_numpy = np.swapaxes(np.swapaxes(test_images_cpu.numpy(), 1, -1), 1, 2)
         shap_numpy = [np.swapaxes(np.swapaxes(s, 1, -1), 1, 2) for s in shap_values]
         test_numpy = np.swapaxes(np.swapaxes(test_images_cpu.numpy(), 1, -1), 1, 2)
-        shap.image_plot(shap_numpy, -test_numpy)
+        shap.image_plot(shap_numpy, -test_numpy, show=False)
+        fig = plt.gcf()
+        fig.savefig(f"../figs/{class1}_{class2}/{mode}.png")
+        plt.close(fig)
+
+    plt.ion()
 
 
 def create_dataset(x: int = 1, y: int = 7) -> tuple:
@@ -187,7 +235,7 @@ def create_dataset(x: int = 1, y: int = 7) -> tuple:
     test_indices = test_mask.nonzero().reshape(-1)
     test_subset = torch.utils.data.Subset(test_dataset, test_indices)
     test_loader = torch.utils.data.DataLoader(test_subset, batch_size=args.batch_size, shuffle=True)
-    path = r"..\models\MCDropout" + str(x) + str(y) + ".pth"
+    path = "../models/MCDropout" + str(x) + str(y) + ".pth"
     return train_loader, test_loader, path
 
 
@@ -210,6 +258,7 @@ def main(args):
             train(trainPointModel, device, train_loader, optimizer, epoch)
             #test(meanModel, device, test_loader)
         torch.save(trainPointModel.state_dict(), path)
+        print(f"Model saved at {path}")
 
     if args.train_mode == 'test':
         if args.inference_mode == 'point':
@@ -218,7 +267,7 @@ def main(args):
             pointModel.load_state_dict(torch.load(path))
             out = pointModel(test_images.to(device))
 
-            create_shap_plots(pointModel, background, test_images, args.inference_mode)
+            create_shap_plots(pointModel, background, test_images, args.inference_mode, args.class1, args.class2)
 
         elif args.inference_mode == 'mean':
             #Initialise model(s)
@@ -226,7 +275,7 @@ def main(args):
             meanModel.load_state_dict(torch.load(path))
             out = meanModel(test_images.to(device))
 
-            create_shap_plots(meanModel, background, test_images, args.inference_mode)
+            create_shap_plots(meanModel, background, test_images, args.inference_mode, args.class1, args.class2)
 
         elif args.inference_mode == 'al_entropy':
             #Initialise model(s)
@@ -239,7 +288,7 @@ def main(args):
             indices_cpu = max_entropy.indices.to(torch.device('cpu'))
             test_images = images[indices_cpu].to(device)
 
-            create_shap_plots(alEntropyModel, background, test_images, args.inference_mode)
+            create_shap_plots(alEntropyModel, background, test_images, args.inference_mode, args.class1, args.class2)
 
         elif args.inference_mode == 'total_entropy':
             #Initialise model(s)
@@ -252,7 +301,7 @@ def main(args):
             indices_cpu = max_entropy.indices.to(torch.device('cpu'))
             test_images = images[indices_cpu].to(device)
 
-            create_shap_plots(totalEntropyModel, background, test_images, args.inference_mode)
+            create_shap_plots(totalEntropyModel, background, test_images, args.inference_mode, args.class1, args.class2)
 
         elif args.inference_mode == 'all':
             #Initialise model(s)
@@ -268,15 +317,15 @@ def main(args):
             #Filter subsample for high entropy
             entropies = totalEntropyModel(background)
             mean_entropy = torch.mean(entropies)
-            #max_entropy = torch.topk(entropies.flatten(), 5)
-            #indices_cpu = max_entropy.indices.to(torch.device('cpu'))
-            #test_images = images[indices_cpu].to(device)
+            max_entropy = torch.topk(entropies.flatten(), 5)
+            indices_cpu = max_entropy.indices.to(torch.device('cpu'))
+            test_images = images[indices_cpu].to(device)
             test_images.to(device)
             print('breakdown')
-            create_shap_plots(totalEntropyModel, background, test_images, 'total_entropy')
-            create_shap_plots(alEntropyModel, background, test_images, 'al_entropy')
-            create_shap_plots(epEntropyModel, background, test_images, 'ep_entropy')
-            create_shap_plots(pointModel, background, test_images, 'point')
+            create_shap_plots(totalEntropyModel, background, test_images, 'total_entropy', args.class1, args.class2)
+            create_shap_plots(alEntropyModel, background, test_images, 'al_entropy', args.class1, args.class2)
+            create_shap_plots(epEntropyModel, background, test_images, 'ep_entropy', args.class1, args.class2)
+            create_shap_plots(pointModel, background, test_images, 'point', args.class1, args.class2)
         else:
             print("Invalid inference mode selected!")
 
